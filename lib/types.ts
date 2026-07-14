@@ -91,9 +91,28 @@ export interface ApprovalDecision {
   decidedBy?: string;
 }
 
+/** Output of the fast triage model that runs before the main agent. */
+export interface TriageResult {
+  category:
+    | "refund"
+    | "card_issue"
+    | "credit_limit"
+    | "dispute"
+    | "kyc_unlock"
+    | "fraud"
+    | "general"
+    | "other";
+  urgency: "low" | "medium" | "high";
+  riskHint: RiskLevel;
+  summary: string;
+  suggestedTools: string[];
+  model: string;
+}
+
 /** Events streamed on the `case` namespace → drive the Slack panel + timeline. */
 export type CaseEvent =
   | { kind: "status"; caseId: string; stage: CaseStage; note?: string }
+  | { kind: "triage"; caseId: string; triage: TriageResult }
   | { kind: "approval_request"; request: ApprovalRequest }
   | {
       kind: "approval_resolved";

@@ -1,9 +1,11 @@
 import { DurableAgent } from "@workflow/ai/agent";
 import { mockSequenceModel } from "@workflow/ai/test";
 import { createHook, getWritable, sleep } from "workflow";
+import { generateObject } from "ai";
 import { z } from "zod";
 import type { ModelMessage, UIMessageChunk } from "ai";
 import { AGENT_INSTRUCTIONS } from "@/lib/instructions";
+import { searchKnowledge } from "@/lib/knowledge";
 import {
   applyBlockAndReissue,
   applyFlagFraud,
@@ -26,9 +28,13 @@ import type {
   CaseEvent,
   RiskLevel,
   SensitiveTool,
+  TriageResult,
 } from "@/lib/types";
 
+// Multi-model: a fast/cheap model triages every case; a stronger model runs the
+// conversation + tool use. Both are swappable via env (Vercel AI Gateway slugs).
 const AGENT_MODEL = process.env.AGENT_MODEL ?? "anthropic/claude-sonnet-4-5";
+const TRIAGE_MODEL = process.env.TRIAGE_MODEL ?? "anthropic/claude-haiku-4-5";
 /** How long a sensitive action waits for a human before timing out. */
 const APPROVAL_TIMEOUT = process.env.APPROVAL_TIMEOUT ?? "24h";
 /** Refunds at or below this auto-execute; above it require human approval. */
@@ -214,12 +220,89 @@ async function lookupTransactionsStep(customerId: string, limit: number) {
   };
 }
 
+// ── RAG: consult the Vela knowledge base (step) ──────────────────────────────
+async function searchKnowledgeStep(query: string) {
+  "use step";
+  const results = searchKnowledge(query, 3);
+  if (results.length === 0)
+    return { query, results: [], note: "No matching policy/FAQ found. Do not invent a policy." };
+  return {
+    query,
+    results: results.map((r) => ({ source: `${r.doc} — ${r.title}`, content: r.text })),
+  };
+}
+
+// ── Triage: a fast model classifies the case before the main agent (step) ────
+async function triageStep(userText: string): Promise<TriageResult> {
+  "use step";
+  if (process.env.AGENT_MOCK === "1") {
+    return {
+      category: "refund",
+      urgency: "medium",
+      riskHint: "medium",
+      summary: "Customer reports a duplicate charge and wants the duplicate refunded.",
+      suggestedTools: ["searchKnowledgeBase", "lookupTransactions", "issueRefund"],
+      model: "mock",
+    };
+  }
+  try {
+    const { object } = await generateObject({
+      model: TRIAGE_MODEL,
+      schema: z.object({
+        category: z.enum([
+          "refund",
+          "card_issue",
+          "credit_limit",
+          "dispute",
+          "kyc_unlock",
+          "fraud",
+          "general",
+          "other",
+        ]),
+        urgency: z.enum(["low", "medium", "high"]),
+        riskHint: z.enum(["low", "medium", "high"]),
+        summary: z.string().describe("one-sentence summary of what the customer needs"),
+        suggestedTools: z.array(z.string()),
+      }),
+      prompt:
+        "You are a triage classifier for a fintech Customer Success agent. Classify the customer's message: category, urgency, a risk hint for any action it may require, a one-sentence summary, and which tools are likely needed (from: searchKnowledgeBase, lookupCustomer, lookupCard, lookupTransactions, issueRefund, blockAndReissueCard, raiseCreditLimit, openDispute, unlockKyc, flagFraud).\n\nCustomer message:\n\"" +
+        userText +
+        '"',
+    });
+    return { ...object, model: TRIAGE_MODEL };
+  } catch {
+    return {
+      category: "general",
+      urgency: "medium",
+      riskHint: "medium",
+      summary: "Auto-triage unavailable; proceed by gathering facts.",
+      suggestedTools: [],
+      model: TRIAGE_MODEL,
+    };
+  }
+}
+
+function lastUserText(messages: ModelMessage[]): string {
+  const last = [...messages].reverse().find((m) => m.role === "user");
+  if (!last) return "";
+  if (typeof last.content === "string") return last.content;
+  if (Array.isArray(last.content))
+    return last.content.map((p) => (p.type === "text" ? p.text : "")).join(" ").trim();
+  return "";
+}
+
 function caseIdOf(options: unknown): string {
   return (options as { experimental_context?: { caseId?: string } })?.experimental_context?.caseId ?? "unknown";
 }
 
 // ── The durable Customer Success agent ───────────────────────────────────────
 const tools = {
+  searchKnowledgeBase: {
+    description:
+      "Search Vela's company handbook & FAQ for policies, limits, timelines, fees, and answers. ALWAYS consult this before quoting a policy or proposing a sensitive action, and ground your Slack justification in what it returns.",
+    inputSchema: z.object({ query: z.string().describe("policy or FAQ question, e.g. 'refund policy over $100'") }),
+    execute: async ({ query }: { query: string }) => searchKnowledgeStep(query),
+  },
   lookupCustomer: {
     description: "Look up a customer by id, email, or name. Returns profile, tier, KYC status, credit limit, balance, and their card.",
     inputSchema: z.object({ query: z.string().describe("customer id, email, or name") }),
@@ -376,12 +459,30 @@ export async function supportAgentWorkflow(caseId: string, messages: ModelMessag
 
   await emitCase({ kind: "status", caseId, stage: "gathering" });
 
-  // AGENT_MOCK=1 lets the whole human-in-the-loop flow be exercised with no LLM
-  // key: the agent deterministically requests a $250 refund (needs approval),
-  // then confirms. Used for the offline end-to-end verification in the README.
+  // Multi-model step 1: a fast model triages the incoming request.
+  const triage = await triageStep(lastUserText(messages));
+  await emitCase({ kind: "triage", caseId, triage });
+
+  const instructions = `${AGENT_INSTRUCTIONS}
+
+# Automated triage (from a fast model: ${triage.model})
+Category: ${triage.category} · urgency: ${triage.urgency} · risk hint: ${triage.riskHint}
+Summary: ${triage.summary}
+Likely tools: ${triage.suggestedTools.join(", ") || "—"}
+Treat this as a hint only. Still gather facts with the lookup tools and consult
+the knowledge base before acting.`;
+
+  // AGENT_MOCK=1 lets the whole flow be exercised with no LLM key: the agent
+  // deterministically consults the knowledge base, requests a $250 refund (needs
+  // approval), then confirms. Used for the offline end-to-end verification.
   const model =
     process.env.AGENT_MOCK === "1"
       ? mockSequenceModel([
+          {
+            type: "tool-call",
+            toolName: "searchKnowledgeBase",
+            input: JSON.stringify({ query: "refund policy for a duplicate charge over $100" }),
+          },
           {
             type: "tool-call",
             toolName: "issueRefund",
@@ -390,7 +491,7 @@ export async function supportAgentWorkflow(caseId: string, messages: ModelMessag
               transactionId: "txn_1002",
               amountUsd: 250,
               reason:
-                "Duplicate SkyHigh Airlines charge ($250) confirmed on txn_1002; customer Ana Torres requests refund of the duplicate.",
+                "Duplicate SkyHigh Airlines charge ($250) confirmed on txn_1002; per Vela refund policy amounts over $100 need approval; customer Ana Torres requests the duplicate refunded.",
             }),
           },
           {
@@ -400,9 +501,10 @@ export async function supportAgentWorkflow(caseId: string, messages: ModelMessag
         ])
       : AGENT_MODEL;
 
+  // Multi-model step 2: the stronger model runs the conversation + tools.
   const agent = new DurableAgent({
     model,
-    instructions: AGENT_INSTRUCTIONS,
+    instructions,
     tools,
   });
 
@@ -410,7 +512,7 @@ export async function supportAgentWorkflow(caseId: string, messages: ModelMessag
     messages,
     writable: getWritable<UIMessageChunk>(),
     experimental_context: { caseId },
-    maxSteps: 12,
+    maxSteps: 14,
   });
 
   await emitCase({ kind: "status", caseId, stage: "done" });

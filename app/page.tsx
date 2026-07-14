@@ -3,7 +3,7 @@
 import { useChat } from "@ai-sdk/react";
 import { WorkflowChatTransport } from "@workflow/ai";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ApprovalRequest, CaseEvent, CaseStage } from "@/lib/types";
+import type { ApprovalRequest, CaseEvent, CaseStage, TriageResult } from "@/lib/types";
 
 type PanelItem = { request: ApprovalRequest; resolved?: { approved: boolean; reason?: string } };
 type TimelineItem = { caseId: string; stage: CaseStage; note?: string; ts: number };
@@ -38,6 +38,7 @@ export default function Page() {
   const [runId, setRunId] = useState<string | null>(null);
   const [panel, setPanel] = useState<Record<string, PanelItem>>({});
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
+  const [triage, setTriage] = useState<TriageResult | null>(null);
   const [input, setInput] = useState("");
   const [denyReason, setDenyReason] = useState<Record<string, string>>({});
   const setRunIdRef = useRef(setRunId);
@@ -93,6 +94,8 @@ export default function Page() {
   function applyEvent(event: CaseEvent) {
     if (event.kind === "status") {
       setTimeline((t) => [...t, { caseId: event.caseId, stage: event.stage, note: event.note, ts: Date.now() }]);
+    } else if (event.kind === "triage") {
+      setTriage(event.triage);
     } else if (event.kind === "approval_request") {
       setPanel((p) => ({ ...p, [event.request.token]: { request: event.request } }));
     } else if (event.kind === "approval_resolved") {
@@ -235,6 +238,25 @@ export default function Page() {
               ))}
             </div>
           </div>
+
+          {triage && (
+            <div className="rounded-xl border border-indigo-300 bg-indigo-50/40 dark:border-indigo-500/40 dark:bg-indigo-500/5">
+              <div className="border-b border-indigo-200/60 px-4 py-2 text-sm font-medium dark:border-indigo-500/30">
+                🧭 Triage · <span className="font-mono text-xs text-indigo-600 dark:text-indigo-300">{triage.model}</span>
+              </div>
+              <div className="space-y-1 p-3 text-sm">
+                <div className="flex flex-wrap gap-1.5">
+                  <span className="rounded-full bg-indigo-600/10 px-2 py-0.5 text-xs text-indigo-700 dark:text-indigo-300">{triage.category}</span>
+                  <span className="rounded-full bg-indigo-600/10 px-2 py-0.5 text-xs text-indigo-700 dark:text-indigo-300">urgency: {triage.urgency}</span>
+                  <span className="rounded-full bg-indigo-600/10 px-2 py-0.5 text-xs text-indigo-700 dark:text-indigo-300">risk: {triage.riskHint}</span>
+                </div>
+                <p className="text-zinc-600 dark:text-zinc-300">{triage.summary}</p>
+                {triage.suggestedTools.length > 0 && (
+                  <p className="text-xs text-zinc-500">tools: {triage.suggestedTools.join(", ")}</p>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="flex-1 rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
             <div className="border-b border-zinc-200 px-4 py-2 text-sm font-medium dark:border-zinc-800">🕑 Case timeline</div>
