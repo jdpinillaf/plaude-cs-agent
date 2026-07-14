@@ -59,12 +59,12 @@ async function emitCase(event: CaseEvent) {
   // Persist to conversation history alongside streaming to the UI.
   try {
     if (event.kind === "status") {
-      recordStatus(event.caseId, event.stage);
+      await recordStatus(event.caseId, event.stage);
       if (["executed", "denied", "timed_out"].includes(event.stage) && event.note) {
-        recordAction(event.caseId, `${event.stage}: ${event.note}`);
+        await recordAction(event.caseId, `${event.stage}: ${event.note}`);
       }
     } else if (event.kind === "approval_request") {
-      recordCustomer(event.request.caseId, event.request.customer.id, event.request.customer.name);
+      await recordCustomer(event.request.caseId, event.request.customer.id, event.request.customer.name);
     }
   } catch {
     // history is best-effort; never break the stream
@@ -270,7 +270,7 @@ async function ensureConversationStep(
   models: { triage: string; agent: string },
 ) {
   "use step";
-  startConversation({
+  await startConversation({
     id: caseId,
     runId: caseId,
     title: firstUserMessage || "Conversation",
@@ -282,7 +282,7 @@ async function ensureConversationStep(
 /** Recompute totals, stream a usage event, and fire a one-time alert if over budget. */
 async function emitUsageStep(caseId: string) {
   "use step";
-  const rec = getConversation(caseId);
+  const rec = await getConversation(caseId);
   const tokens = rec?.tokens ?? { triage: { input: 0, output: 0, total: 0 }, agent: { input: 0, output: 0, total: 0 }, total: 0 };
   const alert = (rec?.alert ?? false) === true;
   const writer = getWritable<CaseEvent>({ namespace: "case" }).getWriter();
@@ -291,7 +291,7 @@ async function emitUsageStep(caseId: string) {
   } finally {
     writer.releaseLock();
   }
-  if (alert && shouldSendAlert(caseId)) {
+  if (alert && (await shouldSendAlert(caseId))) {
     await postTokenAlertToSlack({
       caseId,
       customerName: rec?.customerName,
@@ -307,8 +307,8 @@ async function recordAgentFinishStep(
   messages: { role: "user" | "assistant"; text: string }[],
 ) {
   "use step";
-  addUsage(caseId, "agent", usage);
-  recordFinalMessages(caseId, messages);
+  await addUsage(caseId, "agent", usage);
+  await recordFinalMessages(caseId, messages);
 }
 
 // ── Triage: a fast model classifies the case before the main agent (step) ────
@@ -318,7 +318,7 @@ async function triageStep(caseId: string, userText: string): Promise<TriageResul
     const summary = "Customer reports a duplicate charge and wants the duplicate refunded.";
     const tin = estimateTokens(userText);
     const tout = estimateTokens(summary);
-    addUsage(caseId, "triage", { input: tin, output: tout, total: tin + tout });
+    await addUsage(caseId, "triage", { input: tin, output: tout, total: tin + tout });
     return {
       category: "refund",
       urgency: "medium",
@@ -352,7 +352,7 @@ async function triageStep(caseId: string, userText: string): Promise<TriageResul
         userText +
         '"',
     });
-    addUsage(caseId, "triage", {
+    await addUsage(caseId, "triage", {
       input: usage?.inputTokens ?? 0,
       output: usage?.outputTokens ?? 0,
       total: usage?.totalTokens ?? 0,

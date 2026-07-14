@@ -7,6 +7,6 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   return Response.json({
     threshold: TOKEN_ALERT_THRESHOLD,
-    conversations: listConversations(),
+    conversations: await listConversations(),
   });
 }
