@@ -9,9 +9,11 @@ irreversible. On a **denial** it reads the reviewer's reason and reroutes the
 conversation itself — no human takeover.
 
 Built on **[Workflow Development Kit](https://workflow.dev)** `DurableAgent`,
-Next.js, and the Vercel AI Gateway. The whole approve/deny loop is exercisable
-**with zero Slack setup** (an in-app mock panel that hits the same endpoint) and
-also with a **real Slack app**.
+Next.js, and the Vercel AI Gateway. It uses a **multi-model** setup (a fast model
+triages every case, a stronger model runs the conversation) and **RAG** over a
+company knowledge base so answers and approvals are grounded in real policy. The
+whole approve/deny loop is exercisable **with zero Slack setup** (an in-app mock
+panel that hits the same endpoint) and also with a **real Slack app**.
 
 > Built for the Plaude engineering challenge — goes past the brief (a generic
 > approval agent) into a realistic fintech Customer Success scenario with full
@@ -48,8 +50,10 @@ mode so it works without billing; see [LLM on the live deploy](#llm-on-the-live-
    │  POST /api/chat  (WorkflowChatTransport → useChat)
    ▼
  start(supportAgentWorkflow)          ── "use workflow" ──────────────────────┐
-   DurableAgent(model, instructions, tools)                                   │
-     read-only tools  → lookupCustomer / lookupCard / lookupTransactions      │  streams
+   triageStep(fast model)  → classify case (category, risk, tools) ───────────┤
+   DurableAgent(strong model, instructions, tools)                            │
+     read-only tools  → searchKnowledgeBase (RAG) / lookupCustomer /          │  streams
+                        lookupCard / lookupTransactions                       │
      sensitive tools  → issueRefund / blockAndReissueCard / raiseCreditLimit  │  UIMessageChunks
                         openDispute / unlockKyc / flagFraud                   │  (default stream)
         inside a sensitive tool (workflow-level, NOT a step):                 │
@@ -76,6 +80,36 @@ access). The sensitive tools' `execute` is **workflow-level** so it can call
 resumes the hook. That is the whole human-in-the-loop mechanism.
 
 ---
+
+## Multi-model
+
+Two models cooperate per case (both are Vercel AI Gateway slugs, swappable via env):
+
+1. **Triage** (`TRIAGE_MODEL`, default `anthropic/claude-haiku-4-5`) — a fast,
+   cheap model runs first and classifies the request into a structured result
+   (category, urgency, risk hint, one-line summary, likely tools). It's shown in
+   the UI and injected as a hint into the main agent's instructions.
+2. **Agent** (`AGENT_MODEL`, default `anthropic/claude-sonnet-4-5`) — the stronger
+   model runs the actual conversation, tool use, and human-in-the-loop.
+
+This mirrors a real triage → specialist handoff and keeps the expensive model off
+the cheap classification step. See `triageStep` in `workflows/support-agent.ts`.
+
+## RAG — grounding in Vela's policies
+
+The agent does **not** answer policy questions from memory. A `searchKnowledgeBase`
+tool retrieves the most relevant sections of the company knowledge base and the
+agent must consult it before quoting a policy or proposing a sensitive action, and
+grounds its Slack justification in what it finds.
+
+- Knowledge base: [`knowledge/vela-company.md`](knowledge/vela-company.md) (policy
+  handbook) + [`knowledge/vela-faq.md`](knowledge/vela-faq.md) (customer FAQ) for a
+  fictional fintech, **Vela**.
+- Retrieval: dependency-free **lexical (BM25-lite)** search over `##`-chunked
+  sections ([`lib/knowledge.ts`](lib/knowledge.ts)) — no embedding service or vector
+  DB, so it runs everywhere including offline. Swap in embeddings later if desired.
+
+Edit the markdown to change what the agent knows; no code changes required.
 
 ## The plain-text instructions
 
@@ -162,7 +196,8 @@ natural next step.)
 | Variable | Required | Purpose |
 |---|---|---|
 | `AI_GATEWAY_API_KEY` | ✅ | LLM access via Vercel AI Gateway |
-| `AGENT_MODEL` | – | Gateway model slug (default `anthropic/claude-sonnet-4-5`) |
+| `AGENT_MODEL` | – | Main model — gateway slug (default `anthropic/claude-sonnet-4-5`) |
+| `TRIAGE_MODEL` | – | Fast triage model (default `anthropic/claude-haiku-4-5`) |
 | `SLACK_BOT_TOKEN` | – | Enables real Slack posting (`chat:write`) |
 | `SLACK_CHANNEL_ID` | – | Channel for approval requests |
 | `SLACK_SIGNING_SECRET` | – | Verifies Slack interactive requests |
@@ -176,6 +211,7 @@ natural next step.)
 
 | Tool | Approval | Notes |
 |---|---|---|
+| `searchKnowledgeBase` | none | RAG over Vela policy + FAQ; consulted before acting |
 | `lookupCustomer` / `lookupCard` / `lookupTransactions` | none | read-only, gather facts first |
 | `issueRefund` | > $100 | duplicate/erroneous charge |
 | `blockAndReissueCard` | always | fraud / lost card |
@@ -221,7 +257,9 @@ app/
   api/chat/[runId]/stream/     # reconnect endpoint for WorkflowChatTransport
   api/case-events/route.ts     # stream the "case" namespace (approvals + timeline)
   api/slack/actions/route.ts   # resumeHook from Slack button OR mock panel
-workflows/support-agent.ts     # DurableAgent, tools, requireApproval() human-in-the-loop
+workflows/support-agent.ts     # DurableAgent, triageStep, tools, requireApproval()
+knowledge/vela-*.md            # ← RAG knowledge base (company handbook + FAQ)
+lib/knowledge.ts               # lexical (BM25-lite) retrieval over the knowledge base
 lib/instructions.ts            # ← the plain-text agent instructions
 lib/data.ts                    # mock fintech records + mutations
 lib/slack.ts                   # Block Kit builder, postMessage, signature verify
@@ -234,4 +272,5 @@ lib/types.ts                   # shared types
 ## Tech
 
 Next.js 16 · Workflow Development Kit (`workflow`, `@workflow/ai`) · AI SDK v6 ·
-Vercel AI Gateway (Anthropic Claude) · Slack Web API · Tailwind · TypeScript.
+Vercel AI Gateway (multi-model: Claude Haiku triage + Sonnet agent) · lexical RAG ·
+Slack Web API · Tailwind · TypeScript.
