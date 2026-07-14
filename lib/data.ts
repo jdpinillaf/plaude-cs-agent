@@ -103,6 +103,39 @@ export function maskedPan(card: Card): string {
   return `${card.network === "visa" ? "Visa" : "Mastercard"} •••• ${card.last4}`;
 }
 
+// ── Account view (for the logged-in customer UI) ─────────────────────────────
+export function listPersonas() {
+  return store.customers.map((c) => ({ id: c.id, name: c.name, tier: c.tier }));
+}
+
+export function getAccount(customerId: string) {
+  const c = getCustomer(customerId);
+  if (!c) return null;
+  const card = getCardByCustomer(c.id);
+  const txns = getTransactions(c.id, 10);
+  return {
+    customer: {
+      id: c.id,
+      name: c.name,
+      email: c.email,
+      tier: c.tier,
+      kycStatus: c.kycStatus,
+      creditLimit: usd(c.creditLimitCents),
+      balance: usd(c.balanceCents),
+    },
+    card: card
+      ? { id: card.id, network: card.network, last4: card.last4, status: card.status, maskedPan: maskedPan(card) }
+      : null,
+    transactions: txns.map((t) => ({
+      id: t.id,
+      amount: usd(t.amountCents),
+      merchant: t.merchant,
+      date: t.date,
+      status: t.status,
+    })),
+  };
+}
+
 // ── Mutations (the real effect of an approved sensitive action) ──────────────
 export function applyRefund(transactionId: string, amountCents: number) {
   const txn = getTransaction(transactionId);

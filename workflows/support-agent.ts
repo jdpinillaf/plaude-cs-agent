@@ -312,6 +312,25 @@ async function recordAgentFinishStep(
   await recordFinalMessages(caseId, messages);
 }
 
+// ── Logged-in user context (step) ────────────────────────────────────────────
+async function loadUserStep(userId: string, caseId: string) {
+  "use step";
+  const c = getCustomer(userId);
+  if (!c) return null;
+  await recordCustomer(caseId, c.id, c.name);
+  const card = getCardByCustomer(c.id);
+  return {
+    id: c.id,
+    name: c.name,
+    email: c.email,
+    tier: c.tier,
+    kycStatus: c.kycStatus,
+    balance: usd(c.balanceCents),
+    creditLimit: usd(c.creditLimitCents),
+    card: card ? maskedPan(card) : "none on file",
+  };
+}
+
 // ── Triage: a fast model classifies the case before the main agent (step) ────
 async function triageStep(caseId: string, userText: string): Promise<TriageResult> {
   "use step";
@@ -556,19 +575,31 @@ const tools = {
   },
 };
 
-export async function supportAgentWorkflow(caseId: string, messages: ModelMessage[]) {
+export async function supportAgentWorkflow(caseId: string, userId: string, messages: ModelMessage[]) {
   "use workflow";
 
   const userText = lastUserText(messages);
   await ensureConversationStep(caseId, userText, { triage: TRIAGE_MODEL, agent: AGENT_MODEL });
   await emitCase({ kind: "status", caseId, stage: "gathering" });
 
+  // The customer is already signed in — load their context so the agent never
+  // has to ask them to identify themselves.
+  const user = await loadUserStep(userId, caseId);
+  const userContext = user
+    ? `
+
+# Signed-in customer (you already have their details — NEVER ask them to identify themselves)
+${user.name} — ${user.id} · ${user.tier} · KYC ${user.kycStatus}
+Email ${user.email} · Card ${user.card} · Balance ${user.balance} · Credit limit ${user.creditLimit}
+Use "${user.id}" as the customerId for every lookup and action.`
+    : "";
+
   // Multi-model step 1: a fast model triages the incoming request.
   const triage = await triageStep(caseId, userText);
   await emitCase({ kind: "triage", caseId, triage });
   await emitUsageStep(caseId);
 
-  const instructions = `${AGENT_INSTRUCTIONS}
+  const instructions = `${AGENT_INSTRUCTIONS}${userContext}
 
 # Automated triage (from a fast model: ${triage.model})
 Category: ${triage.category} · urgency: ${triage.urgency} · risk hint: ${triage.riskHint}

@@ -14,10 +14,10 @@ export const maxDuration = 300;
  * uses it to subscribe to the case/approval stream).
  */
 export async function POST(req: Request) {
-  const { messages } = (await req.json()) as { messages: UIMessage[] };
+  const { messages, userId } = (await req.json()) as { messages: UIMessage[]; userId?: string };
   const caseId = crypto.randomUUID();
   const modelMessages = await convertToModelMessages(messages);
-  const args: [string, ModelMessage[]] = [caseId, modelMessages];
+  const args: [string, string, ModelMessage[]] = [caseId, userId ?? "cus_ana", modelMessages];
 
   const run = await start(supportAgentWorkflow, args);
 
