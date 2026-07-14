@@ -17,6 +17,10 @@ also with a **real Slack app**.
 > approval agent) into a realistic fintech Customer Success scenario with full
 > case context, risk levels, thresholds, and per-scenario denial playbooks.
 
+**▶ Live demo: https://plaude-cs-agent.vercel.app** — click a suggested scenario,
+then Approve/Deny in the Slack-review panel. (The live deploy runs in `AGENT_MOCK`
+mode so it works without billing; see [LLM on the live deploy](#llm-on-the-live-deploy).)
+
 ---
 
 ## Demo flow
@@ -114,6 +118,17 @@ AGENT_MOCK=1 pnpm dev
 `AGENT_MOCK=1` swaps in a deterministic mock model (via `@workflow/ai/test`) that
 requests a $250 refund and then confirms — so the **entire suspend → approve/deny
 → resume loop is verifiable without any API key**. Used by the e2e check below.
+
+---
+
+### LLM on the live deploy
+
+The workflow, streaming, hooks, and AI Gateway auth (via Vercel OIDC — no key
+needed) all run on the production deploy. The one requirement for the **real**
+LLM is a credit card on the Vercel account (unlocks AI Gateway free credits).
+So the public demo is deployed with `AGENT_MOCK=1` to be fully usable without
+billing. To run the real agent on Vercel: add a card (or set
+`AI_GATEWAY_API_KEY`), remove the `AGENT_MOCK` env var, and redeploy.
 
 ---
 
