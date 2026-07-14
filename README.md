@@ -111,6 +111,26 @@ grounds its Slack justification in what it finds.
 
 Edit the markdown to change what the agent knows; no code changes required.
 
+## Conversation history & token budgets
+
+Every conversation is recorded with its transcript, the actions taken, and a
+**per-model token breakdown** (triage vs. agent). The **History** page
+(`/conversations`) lists them and opens any one to see the transcript and where
+the tokens went.
+
+- **Live token counter** in the chat header, updated as the run streams.
+- **Alerts**: when a conversation exceeds `TOKEN_ALERT_THRESHOLD` tokens, the UI
+  shows a warning banner and (if Slack is configured) posts an alert to the
+  channel — once per conversation.
+- Token usage comes from the models' reported usage (`generateObject` for triage,
+  `onFinish.totalUsage` for the agent), with a length-based estimate as a fallback.
+
+![Conversation history with per-model token usage and an over-budget alert](docs/history.png)
+
+Storage is in-memory ([`lib/conversations.ts`](lib/conversations.ts)) — great for
+the demo and local dev; swap it for Vercel KV / Postgres for durable,
+cross-instance history (same interface).
+
 ## The plain-text instructions
 
 The agent's entire behavior lives in **[`lib/instructions.ts`](lib/instructions.ts)** —
@@ -203,6 +223,7 @@ natural next step.)
 | `SLACK_SIGNING_SECRET` | – | Verifies Slack interactive requests |
 | `APPROVAL_TIMEOUT` | – | How long to wait for a human (e.g. `30s`, `24h`; default `24h`) |
 | `REFUND_AUTO_LIMIT_CENTS` | – | Refunds at/under this auto-approve (default `10000` = $100) |
+| `TOKEN_ALERT_THRESHOLD` | – | Alert when a conversation exceeds this many tokens (default `15000`) |
 | `AGENT_MOCK` | – | `1` → offline deterministic model (no LLM key) |
 
 ---
@@ -252,15 +273,18 @@ pnpm typecheck && pnpm build
 
 ```
 app/
-  page.tsx                     # chat + Slack-review panel + case timeline (client)
+  page.tsx                     # chat + Slack-review panel + timeline + live token counter
+  conversations/page.tsx       # history: token usage per conversation + transcripts
   api/chat/route.ts            # start workflow, stream UIMessageChunks (x-workflow-run-id)
   api/chat/[runId]/stream/     # reconnect endpoint for WorkflowChatTransport
-  api/case-events/route.ts     # stream the "case" namespace (approvals + timeline)
+  api/case-events/route.ts     # stream the "case" namespace (approvals + timeline + usage)
+  api/conversations/route.ts   # list conversations; [id] returns one transcript
   api/slack/actions/route.ts   # resumeHook from Slack button OR mock panel
 workflows/support-agent.ts     # DurableAgent, triageStep, tools, requireApproval()
 knowledge/vela-*.md            # ← RAG knowledge base (company handbook + FAQ)
 lib/knowledge.ts               # lexical (BM25-lite) retrieval over the knowledge base
 lib/instructions.ts            # ← the plain-text agent instructions
+lib/conversations.ts           # in-memory conversation history + token accounting
 lib/data.ts                    # mock fintech records + mutations
 lib/slack.ts                   # Block Kit builder, postMessage, signature verify
 lib/sse.ts                     # frame workflow object streams as SSE for the client

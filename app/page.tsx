@@ -3,7 +3,8 @@
 import { useChat } from "@ai-sdk/react";
 import { WorkflowChatTransport } from "@workflow/ai";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ApprovalRequest, CaseEvent, CaseStage, TriageResult } from "@/lib/types";
+import Link from "next/link";
+import type { ApprovalRequest, CaseEvent, CaseStage, ConversationTokens, TriageResult } from "@/lib/types";
 
 type PanelItem = { request: ApprovalRequest; resolved?: { approved: boolean; reason?: string } };
 type TimelineItem = { caseId: string; stage: CaseStage; note?: string; ts: number };
@@ -39,6 +40,7 @@ export default function Page() {
   const [panel, setPanel] = useState<Record<string, PanelItem>>({});
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [triage, setTriage] = useState<TriageResult | null>(null);
+  const [usage, setUsage] = useState<{ tokens: ConversationTokens; threshold: number; alert: boolean } | null>(null);
   const [input, setInput] = useState("");
   const [denyReason, setDenyReason] = useState<Record<string, string>>({});
   const setRunIdRef = useRef(setRunId);
@@ -96,6 +98,8 @@ export default function Page() {
       setTimeline((t) => [...t, { caseId: event.caseId, stage: event.stage, note: event.note, ts: Date.now() }]);
     } else if (event.kind === "triage") {
       setTriage(event.triage);
+    } else if (event.kind === "usage") {
+      setUsage({ tokens: event.tokens, threshold: event.threshold, alert: event.alert });
     } else if (event.kind === "approval_request") {
       setPanel((p) => ({ ...p, [event.request.token]: { request: event.request } }));
     } else if (event.kind === "approval_resolved") {
@@ -122,6 +126,8 @@ export default function Page() {
     const value = text.trim();
     if (!value) return;
     setInput("");
+    setTriage(null);
+    setUsage(null);
     sendMessage({ text: value });
   }
 
@@ -131,17 +137,43 @@ export default function Page() {
 
   return (
     <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-4 p-4 md:p-6">
-      <header className="flex items-center justify-between">
+      <header className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h1 className="text-xl font-semibold">Nova · Fintech Customer Success Agent</h1>
           <p className="text-sm text-zinc-500">Human-in-the-loop approvals over Slack · Workflow DevKit DurableAgent</p>
         </div>
-        {pending.length > 0 && (
-          <span className="animate-pulse rounded-full bg-amber-500/15 px-3 py-1 text-sm font-medium text-amber-600">
-            {pending.length} awaiting approval
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {usage && (
+            <span
+              className={`rounded-full px-3 py-1 text-sm font-medium ${
+                usage.alert ? "bg-rose-500/15 text-rose-600" : "bg-zinc-500/10 text-zinc-600 dark:text-zinc-300"
+              }`}
+              title={`triage ${usage.tokens.triage.total} + agent ${usage.tokens.agent.total} · threshold ${usage.threshold}`}
+            >
+              {usage.alert ? "⚠️ " : "🔢 "}
+              {usage.tokens.total.toLocaleString()} tokens
+            </span>
+          )}
+          {pending.length > 0 && (
+            <span className="animate-pulse rounded-full bg-amber-500/15 px-3 py-1 text-sm font-medium text-amber-600">
+              {pending.length} awaiting approval
+            </span>
+          )}
+          <Link
+            href="/conversations"
+            className="rounded-full border border-zinc-300 px-3 py-1 text-sm font-medium hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
+          >
+            History →
+          </Link>
+        </div>
       </header>
+
+      {usage?.alert && (
+        <div className="rounded-lg border border-rose-300 bg-rose-50/50 px-4 py-2 text-sm text-rose-700 dark:border-rose-500/40 dark:bg-rose-500/5 dark:text-rose-300">
+          ⚠️ High token usage — this conversation used {usage.tokens.total.toLocaleString()} tokens, over the{" "}
+          {usage.threshold.toLocaleString()} threshold. An alert was raised (and posted to Slack if configured).
+        </div>
+      )}
 
       <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_420px]">
         {/* Customer chat */}

@@ -109,6 +109,20 @@ export interface TriageResult {
   model: string;
 }
 
+/** Token usage for a model call or a whole conversation. */
+export interface TokenUsage {
+  input: number;
+  output: number;
+  total: number;
+}
+
+/** Per-conversation token breakdown across the two models. */
+export interface ConversationTokens {
+  triage: TokenUsage;
+  agent: TokenUsage;
+  total: number;
+}
+
 /** Events streamed on the `case` namespace → drive the Slack panel + timeline. */
 export type CaseEvent =
   | { kind: "status"; caseId: string; stage: CaseStage; note?: string }
@@ -120,4 +134,32 @@ export type CaseEvent =
       caseId: string;
       approved: boolean;
       reason?: string;
+    }
+  | {
+      kind: "usage";
+      caseId: string;
+      tokens: ConversationTokens;
+      threshold: number;
+      alert: boolean;
     };
+
+/** A stored conversation (history). */
+export interface ConversationSummary {
+  id: string; // caseId
+  runId: string;
+  customerId?: string;
+  customerName?: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  turns: number;
+  status: CaseStage;
+  tokens: ConversationTokens;
+  alert: boolean;
+  models: { triage: string; agent: string };
+}
+
+export interface ConversationRecord extends ConversationSummary {
+  messages: { role: "user" | "assistant"; text: string }[];
+  actions: string[];
+}

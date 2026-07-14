@@ -7,6 +7,19 @@ import type { ModelMessage, UIMessageChunk } from "ai";
 import { AGENT_INSTRUCTIONS } from "@/lib/instructions";
 import { searchKnowledge } from "@/lib/knowledge";
 import {
+  TOKEN_ALERT_THRESHOLD,
+  addUsage,
+  estimateTokens,
+  getConversation,
+  recordAction,
+  recordCustomer,
+  recordFinalMessages,
+  recordStatus,
+  shouldSendAlert,
+  startConversation,
+} from "@/lib/conversations";
+import { postTokenAlertToSlack } from "@/lib/slack";
+import {
   applyBlockAndReissue,
   applyFlagFraud,
   applyOpenDispute,
@@ -43,6 +56,19 @@ const REFUND_AUTO_LIMIT_CENTS = Number(process.env.REFUND_AUTO_LIMIT_CENTS ?? 10
 // ── Streaming helpers (steps: Node access, durable) ──────────────────────────
 async function emitCase(event: CaseEvent) {
   "use step";
+  // Persist to conversation history alongside streaming to the UI.
+  try {
+    if (event.kind === "status") {
+      recordStatus(event.caseId, event.stage);
+      if (["executed", "denied", "timed_out"].includes(event.stage) && event.note) {
+        recordAction(event.caseId, `${event.stage}: ${event.note}`);
+      }
+    } else if (event.kind === "approval_request") {
+      recordCustomer(event.request.caseId, event.request.customer.id, event.request.customer.name);
+    }
+  } catch {
+    // history is best-effort; never break the stream
+  }
   const writer = getWritable<CaseEvent>({ namespace: "case" }).getWriter();
   try {
     await writer.write(event);
@@ -121,9 +147,14 @@ async function requireApproval(
   p: ApprovalParams,
 ): Promise<{ approved: boolean; reason?: string; timedOut?: boolean }> {
   const token = `case:${p.caseId}:${p.toolCallId}`;
-  await postApproval(token, p);
 
+  // Register the resume hook BEFORE advertising the approval, so a human who
+  // approves the instant they see the request can't race the hook registration.
+  // Awaiting getConflict() suspends the workflow to commit the registration.
   using hook = createHook<{ approved: boolean; reason?: string }>({ token });
+  await hook.getConflict();
+
+  await postApproval(token, p);
 
   const sleepFor = sleep as (duration: string) => Promise<void>;
   const outcome = await Promise.race([
@@ -232,21 +263,73 @@ async function searchKnowledgeStep(query: string) {
   };
 }
 
+// ── Conversation history + token accounting steps ────────────────────────────
+async function ensureConversationStep(
+  caseId: string,
+  firstUserMessage: string,
+  models: { triage: string; agent: string },
+) {
+  "use step";
+  startConversation({
+    id: caseId,
+    runId: caseId,
+    title: firstUserMessage || "Conversation",
+    models,
+    firstUserMessage,
+  });
+}
+
+/** Recompute totals, stream a usage event, and fire a one-time alert if over budget. */
+async function emitUsageStep(caseId: string) {
+  "use step";
+  const rec = getConversation(caseId);
+  const tokens = rec?.tokens ?? { triage: { input: 0, output: 0, total: 0 }, agent: { input: 0, output: 0, total: 0 }, total: 0 };
+  const alert = (rec?.alert ?? false) === true;
+  const writer = getWritable<CaseEvent>({ namespace: "case" }).getWriter();
+  try {
+    await writer.write({ kind: "usage", caseId, tokens, threshold: TOKEN_ALERT_THRESHOLD, alert });
+  } finally {
+    writer.releaseLock();
+  }
+  if (alert && shouldSendAlert(caseId)) {
+    await postTokenAlertToSlack({
+      caseId,
+      customerName: rec?.customerName,
+      total: tokens.total,
+      threshold: TOKEN_ALERT_THRESHOLD,
+    });
+  }
+}
+
+async function recordAgentFinishStep(
+  caseId: string,
+  usage: { input: number; output: number; total: number },
+  messages: { role: "user" | "assistant"; text: string }[],
+) {
+  "use step";
+  addUsage(caseId, "agent", usage);
+  recordFinalMessages(caseId, messages);
+}
+
 // ── Triage: a fast model classifies the case before the main agent (step) ────
-async function triageStep(userText: string): Promise<TriageResult> {
+async function triageStep(caseId: string, userText: string): Promise<TriageResult> {
   "use step";
   if (process.env.AGENT_MOCK === "1") {
+    const summary = "Customer reports a duplicate charge and wants the duplicate refunded.";
+    const tin = estimateTokens(userText);
+    const tout = estimateTokens(summary);
+    addUsage(caseId, "triage", { input: tin, output: tout, total: tin + tout });
     return {
       category: "refund",
       urgency: "medium",
       riskHint: "medium",
-      summary: "Customer reports a duplicate charge and wants the duplicate refunded.",
+      summary,
       suggestedTools: ["searchKnowledgeBase", "lookupTransactions", "issueRefund"],
       model: "mock",
     };
   }
   try {
-    const { object } = await generateObject({
+    const { object, usage } = await generateObject({
       model: TRIAGE_MODEL,
       schema: z.object({
         category: z.enum([
@@ -269,6 +352,11 @@ async function triageStep(userText: string): Promise<TriageResult> {
         userText +
         '"',
     });
+    addUsage(caseId, "triage", {
+      input: usage?.inputTokens ?? 0,
+      output: usage?.outputTokens ?? 0,
+      total: usage?.totalTokens ?? 0,
+    });
     return { ...object, model: TRIAGE_MODEL };
   } catch {
     return {
@@ -289,6 +377,19 @@ function lastUserText(messages: ModelMessage[]): string {
   if (Array.isArray(last.content))
     return last.content.map((p) => (p.type === "text" ? p.text : "")).join(" ").trim();
   return "";
+}
+
+function toTranscript(messages: ModelMessage[]): { role: "user" | "assistant"; text: string }[] {
+  const out: { role: "user" | "assistant"; text: string }[] = [];
+  for (const m of messages) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    let text = "";
+    if (typeof m.content === "string") text = m.content;
+    else if (Array.isArray(m.content))
+      text = m.content.map((p) => (p.type === "text" ? p.text : "")).join(" ").trim();
+    if (text) out.push({ role: m.role, text });
+  }
+  return out;
 }
 
 function caseIdOf(options: unknown): string {
@@ -457,11 +558,14 @@ const tools = {
 export async function supportAgentWorkflow(caseId: string, messages: ModelMessage[]) {
   "use workflow";
 
+  const userText = lastUserText(messages);
+  await ensureConversationStep(caseId, userText, { triage: TRIAGE_MODEL, agent: AGENT_MODEL });
   await emitCase({ kind: "status", caseId, stage: "gathering" });
 
   // Multi-model step 1: a fast model triages the incoming request.
-  const triage = await triageStep(lastUserText(messages));
+  const triage = await triageStep(caseId, userText);
   await emitCase({ kind: "triage", caseId, triage });
+  await emitUsageStep(caseId);
 
   const instructions = `${AGENT_INSTRUCTIONS}
 
@@ -508,13 +612,38 @@ the knowledge base before acting.`;
     tools,
   });
 
+  let agentUsage = { input: 0, output: 0, total: 0 };
+  let transcript: { role: "user" | "assistant"; text: string }[] = [];
+
   const result = await agent.stream({
     messages,
     writable: getWritable<UIMessageChunk>(),
     experimental_context: { caseId },
     maxSteps: 14,
+    onFinish: (event) => {
+      const u = event.totalUsage;
+      const input = u?.inputTokens ?? 0;
+      const output = u?.outputTokens ?? 0;
+      agentUsage = { input, output, total: u?.totalTokens ?? input + output };
+      transcript = toTranscript(event.messages);
+    },
   });
 
+  // Fallback estimate if the model didn't report usage (e.g. mock mode).
+  if (agentUsage.total === 0) {
+    const text = (transcript.length ? transcript : toTranscript(result.messages))
+      .map((m) => m.text)
+      .join(" ");
+    const est = estimateTokens(text);
+    agentUsage = { input: Math.ceil(est * 0.6), output: Math.ceil(est * 0.4), total: est };
+  }
+
+  await recordAgentFinishStep(
+    caseId,
+    agentUsage,
+    transcript.length ? transcript : toTranscript(result.messages),
+  );
   await emitCase({ kind: "status", caseId, stage: "done" });
+  await emitUsageStep(caseId);
   return result.messages;
 }

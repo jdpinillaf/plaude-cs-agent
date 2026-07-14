@@ -75,6 +75,21 @@ export async function postApprovalToSlack(req: ApprovalRequest): Promise<void> {
   });
 }
 
+/** Post a token-usage alert to Slack (no-op in mock mode). */
+export async function postTokenAlertToSlack(input: {
+  caseId: string;
+  customerName?: string;
+  total: number;
+  threshold: number;
+}): Promise<void> {
+  if (!slackEnabled()) return;
+  const client = new WebClient(process.env.SLACK_BOT_TOKEN);
+  await client.chat.postMessage({
+    channel: process.env.SLACK_CHANNEL_ID as string,
+    text: `⚠️ High token usage: conversation for ${input.customerName ?? "a customer"} used ${input.total.toLocaleString()} tokens (threshold ${input.threshold.toLocaleString()}). case \`${input.caseId}\``,
+  });
+}
+
 /** Verify a Slack request signature (v0 HMAC-SHA256). */
 export function verifySlackSignature(headers: Headers, rawBody: string): boolean {
   const secret = process.env.SLACK_SIGNING_SECRET;
