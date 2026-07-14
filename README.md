@@ -1,0 +1,222 @@
+# Nova — Fintech Customer Success Agent
+
+An AI agent, **powered entirely by plain-text instructions**, that runs a
+**human-in-the-loop** Customer Success workflow for a fintech: it talks to a
+customer, diagnoses the case, and when a fix requires a sensitive action
+(refund, block a card, raise a limit, dispute, KYC unlock, fraud freeze) it
+**escalates to a human on Slack for approval** before doing anything
+irreversible. On a **denial** it reads the reviewer's reason and reroutes the
+conversation itself — no human takeover.
+
+Built on **[Workflow Development Kit](https://workflow.dev)** `DurableAgent`,
+Next.js, and the Vercel AI Gateway. The whole approve/deny loop is exercisable
+**with zero Slack setup** (an in-app mock panel that hits the same endpoint) and
+also with a **real Slack app**.
+
+> Built for the Plaude engineering challenge — goes past the brief (a generic
+> approval agent) into a realistic fintech Customer Success scenario with full
+> case context, risk levels, thresholds, and per-scenario denial playbooks.
+
+---
+
+## Demo flow
+
+1. A customer messages Nova: *"SkyHigh Airlines charged me twice for $250, refund the duplicate."*
+2. Nova looks up the customer, card, and transactions (read-only tools).
+3. It proposes `issueRefund` ($250 > $100 → needs approval). The workflow
+   **suspends** and posts the full case to Slack (and the in-app panel):
+   who the customer is, masked card, the transaction, the action, **why**, and a risk level.
+4. A human clicks **Approve** or **Deny (+reason)**.
+   - **Approve** → the workflow resumes, the refund executes, Nova confirms to the customer.
+   - **Deny** → Nova gets the reason and follows its denial playbook (offer a
+     partial refund / open a dispute), staying in control of the chat.
+5. If nobody responds within the timeout, the case times out and Nova tells the
+   customer it's under review — it never claims an action that didn't happen.
+
+![Nova UI: customer chat, Slack review panel, and case timeline](docs/demo.png)
+
+---
+
+## Architecture
+
+```
+ Customer (Next.js chat)
+   │  POST /api/chat  (WorkflowChatTransport → useChat)
+   ▼
+ start(supportAgentWorkflow)          ── "use workflow" ──────────────────────┐
+   DurableAgent(model, instructions, tools)                                   │
+     read-only tools  → lookupCustomer / lookupCard / lookupTransactions      │  streams
+     sensitive tools  → issueRefund / blockAndReissueCard / raiseCreditLimit  │  UIMessageChunks
+                        openDispute / unlockKyc / flagFraud                   │  (default stream)
+        inside a sensitive tool (workflow-level, NOT a step):                 │
+          1. postApproval()   → builds case context, posts to Slack + panel   │  case events
+          2. createHook({ token })      ← SUSPENDS here                       │  (namespace: "case")
+          3. race(hook, sleep(timeout))                                       │
+          4. approved → run mutation step → return result                     │
+             denied   → return {denied, reason} → agent reroutes              │
+                                                                              ▼
+ Reviewer                                                          Case/timeline + Slack panel
+   Slack button ─┐                                                 (GET /api/case-events)
+   Mock panel  ──┴─→ POST /api/slack/actions → resumeHook(token, decision) ──→ RESUMES the workflow
+```
+
+Key Workflow DevKit primitives: **`createHook` / `resumeHook`** for the durable
+suspend-until-human gate, **`start` / `getRun().getReadable()`** for streaming,
+and a namespaced (`case`) stream for approval + timeline events.
+
+### Why sensitive tools are *not* `"use step"`
+
+Read-only lookups and the final mutations are `"use step"` (durable, Node
+access). The sensitive tools' `execute` is **workflow-level** so it can call
+`createHook()` and `sleep()` — the agent loop suspends mid-tool until a human
+resumes the hook. That is the whole human-in-the-loop mechanism.
+
+---
+
+## The plain-text instructions
+
+The agent's entire behavior lives in **[`lib/instructions.ts`](lib/instructions.ts)** —
+identity, when to use each tool, what needs approval and why, how to compose the
+Slack case, and a **per-scenario denial playbook** (refund → partial; limit →
+re-evaluate in 30 days; fraud → protective steps; etc.). Edit that file to change
+what the agent does. No application code changes required.
+
+---
+
+## Getting started
+
+### 1. Install + configure
+
+```bash
+pnpm install
+cp .env.example .env.local
+```
+
+Set **`AI_GATEWAY_API_KEY`** in `.env.local` (required — powers the LLM via the
+[Vercel AI Gateway](https://vercel.com/ai-gateway)). Everything else is optional.
+
+### 2. Run
+
+```bash
+pnpm dev
+# open http://localhost:3000
+```
+
+Click a suggested scenario, then approve/deny in the **Slack review (mock)**
+panel on the right. Watch the case timeline update in real time.
+
+### Try it with no LLM key (offline)
+
+```bash
+AGENT_MOCK=1 pnpm dev
+```
+
+`AGENT_MOCK=1` swaps in a deterministic mock model (via `@workflow/ai/test`) that
+requests a $250 refund and then confirms — so the **entire suspend → approve/deny
+→ resume loop is verifiable without any API key**. Used by the e2e check below.
+
+---
+
+## Real Slack integration
+
+Mock mode needs nothing. To post real Slack messages with Approve/Deny buttons:
+
+1. Create a Slack app → enable **Interactivity**, set the request URL to
+   `https://<your-host>/api/slack/actions` (use a tunnel like `ngrok http 3000`
+   locally, or your Vercel deployment URL).
+2. Add the **`chat:write`** bot scope, install the app, invite the bot to a channel.
+3. Set in `.env.local`:
+
+   ```
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_CHANNEL_ID=C0123ABCD
+   SLACK_SIGNING_SECRET=...
+   ```
+
+With those set, `slackEnabled()` flips on and approval cards are posted to Slack.
+Button clicks are **signature-verified** (`verifySlackSignature`) and resume the
+same workflow via `resumeHook`. The in-app panel keeps working too — both call
+the same endpoint. (Deny reason capture in real Slack uses a fixed reason; the
+mock panel supports a free-text reason — a Slack modal for the reason is the
+natural next step.)
+
+---
+
+## Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `AI_GATEWAY_API_KEY` | ✅ | LLM access via Vercel AI Gateway |
+| `AGENT_MODEL` | – | Gateway model slug (default `anthropic/claude-sonnet-4-5`) |
+| `SLACK_BOT_TOKEN` | – | Enables real Slack posting (`chat:write`) |
+| `SLACK_CHANNEL_ID` | – | Channel for approval requests |
+| `SLACK_SIGNING_SECRET` | – | Verifies Slack interactive requests |
+| `APPROVAL_TIMEOUT` | – | How long to wait for a human (e.g. `30s`, `24h`; default `24h`) |
+| `REFUND_AUTO_LIMIT_CENTS` | – | Refunds at/under this auto-approve (default `10000` = $100) |
+| `AGENT_MOCK` | – | `1` → offline deterministic model (no LLM key) |
+
+---
+
+## Scenarios / tools
+
+| Tool | Approval | Notes |
+|---|---|---|
+| `lookupCustomer` / `lookupCard` / `lookupTransactions` | none | read-only, gather facts first |
+| `issueRefund` | > $100 | duplicate/erroneous charge |
+| `blockAndReissueCard` | always | fraud / lost card |
+| `raiseCreditLimit` | always | high-value |
+| `openDispute` | always | formal chargeback |
+| `unlockKyc` | always | lift compliance freeze |
+| `flagFraud` | always | freeze funds on suspected misuse |
+
+Mock data (3 customers, cards, transactions) lives in
+[`lib/data.ts`](lib/data.ts); approved actions mutate it (balance drops, card
+blocked, etc.). Data resets on restart.
+
+---
+
+## Verify end-to-end
+
+```bash
+# terminal 1
+AGENT_MOCK=1 APPROVAL_TIMEOUT=120s pnpm dev
+# terminal 2 — drives POST /api/chat, waits for the approval, resumes it
+node scripts/e2e.mjs
+```
+
+Expected event sequence:
+`gathering → pending_approval → approval_request → approval_resolved → approved → executed → done`,
+with the assistant's final confirmation text streamed back. (A denied run shows
+`… → denied → done` and Nova reroutes.)
+
+Type check + production build:
+
+```bash
+pnpm typecheck && pnpm build
+```
+
+---
+
+## Project layout
+
+```
+app/
+  page.tsx                     # chat + Slack-review panel + case timeline (client)
+  api/chat/route.ts            # start workflow, stream UIMessageChunks (x-workflow-run-id)
+  api/chat/[runId]/stream/     # reconnect endpoint for WorkflowChatTransport
+  api/case-events/route.ts     # stream the "case" namespace (approvals + timeline)
+  api/slack/actions/route.ts   # resumeHook from Slack button OR mock panel
+workflows/support-agent.ts     # DurableAgent, tools, requireApproval() human-in-the-loop
+lib/instructions.ts            # ← the plain-text agent instructions
+lib/data.ts                    # mock fintech records + mutations
+lib/slack.ts                   # Block Kit builder, postMessage, signature verify
+lib/sse.ts                     # frame workflow object streams as SSE for the client
+lib/types.ts                   # shared types
+```
+
+---
+
+## Tech
+
+Next.js 16 · Workflow Development Kit (`workflow`, `@workflow/ai`) · AI SDK v6 ·
+Vercel AI Gateway (Anthropic Claude) · Slack Web API · Tailwind · TypeScript.

@@ -1,0 +1,104 @@
+export type RiskLevel = "low" | "medium" | "high";
+
+export type CardStatus = "active" | "blocked" | "reissued";
+export type KycStatus = "verified" | "pending" | "frozen";
+export type CustomerTier = "standard" | "premium" | "business";
+export type TxnStatus = "settled" | "pending" | "disputed" | "refunded";
+
+export interface Customer {
+  id: string;
+  name: string;
+  email: string;
+  tier: CustomerTier;
+  kycStatus: KycStatus;
+  creditLimitCents: number;
+  balanceCents: number;
+}
+
+export interface Card {
+  id: string;
+  customerId: string;
+  network: "visa" | "mastercard";
+  last4: string;
+  status: CardStatus;
+}
+
+export interface Transaction {
+  id: string;
+  customerId: string;
+  cardId: string;
+  amountCents: number;
+  currency: string;
+  merchant: string;
+  date: string; // ISO
+  status: TxnStatus;
+}
+
+/** The name of every tool that must go through Slack human approval. */
+export type SensitiveTool =
+  | "issueRefund"
+  | "blockAndReissueCard"
+  | "raiseCreditLimit"
+  | "openDispute"
+  | "unlockKyc"
+  | "flagFraud";
+
+/** Lifecycle of a support case, streamed to the UI timeline. */
+export type CaseStage =
+  | "gathering"
+  | "pending_approval"
+  | "approved"
+  | "denied"
+  | "executed"
+  | "timed_out"
+  | "done";
+
+/**
+ * The full context a human reviewer sees in Slack (and the mock panel) to make
+ * an informed approve/deny decision. Built server-side from the real record.
+ */
+export interface ApprovalRequest {
+  token: string;
+  caseId: string;
+  tool: SensitiveTool;
+  title: string;
+  riskLevel: RiskLevel;
+  action: string;
+  justification: string;
+  amountFormatted?: string;
+  customer: {
+    id: string;
+    name: string;
+    email: string;
+    tier: CustomerTier;
+    kycStatus: KycStatus;
+  };
+  card?: { maskedPan: string; network: string; status: CardStatus };
+  transaction?: {
+    id: string;
+    amountFormatted: string;
+    merchant: string;
+    date: string;
+    status: TxnStatus;
+  };
+  requestedAt: string;
+}
+
+/** How a human resolves a pending approval. */
+export interface ApprovalDecision {
+  approved: boolean;
+  reason?: string;
+  decidedBy?: string;
+}
+
+/** Events streamed on the `case` namespace → drive the Slack panel + timeline. */
+export type CaseEvent =
+  | { kind: "status"; caseId: string; stage: CaseStage; note?: string }
+  | { kind: "approval_request"; request: ApprovalRequest }
+  | {
+      kind: "approval_resolved";
+      token: string;
+      caseId: string;
+      approved: boolean;
+      reason?: string;
+    };
