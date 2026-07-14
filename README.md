@@ -127,13 +127,13 @@ the tokens went.
 
 ![Conversation history with per-model token usage and an over-budget alert](docs/history.png)
 
-Storage is in-memory ([`lib/conversations.ts`](lib/conversations.ts)). The live
-**token counter and alerts work everywhere** (they stream from the active run).
-The **history list** aggregates across runs, so on serverless (Vercel) — where the
-workflow and the API route can run in different instances — it's reliable only
-**locally** (single process) or behind shared storage. Swap `lib/conversations.ts`
-for Vercel KV / Postgres for durable cross-instance history; the interface is the
-same. Run `pnpm dev` to see the full history page populated.
+Storage ([`lib/conversations.ts`](lib/conversations.ts)) uses **Upstash Redis**
+when `KV_REST_API_URL` / `KV_REST_API_TOKEN` are set (the Vercel ↔ Upstash
+integration provides them), so history is durable across serverless instances on
+Vercel. With no Redis configured it falls back to an in-memory store — fine for
+local dev. (We talk to the Upstash REST API over `fetch` in
+[`lib/redis.ts`](lib/redis.ts) because the `@upstash/redis` SDK references
+`EventTarget`, which the Workflow step runtime doesn't provide.)
 
 ## The plain-text instructions
 

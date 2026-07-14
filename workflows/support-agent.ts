@@ -211,10 +211,11 @@ async function stepFlagFraud(customerId: string) {
 }
 
 // ── Read-only lookup tools (steps) ───────────────────────────────────────────
-async function lookupCustomerStep(query: string) {
+async function lookupCustomerStep(query: string, caseId: string) {
   "use step";
   const c = findCustomer(query);
   if (!c) return { found: false as const, message: `No customer matches "${query}".` };
+  await recordCustomer(caseId, c.id, c.name);
   const card = getCardByCustomer(c.id);
   return {
     found: true as const,
@@ -407,7 +408,7 @@ const tools = {
   lookupCustomer: {
     description: "Look up a customer by id, email, or name. Returns profile, tier, KYC status, credit limit, balance, and their card.",
     inputSchema: z.object({ query: z.string().describe("customer id, email, or name") }),
-    execute: async ({ query }: { query: string }) => lookupCustomerStep(query),
+    execute: async ({ query }: { query: string }, options: unknown) => lookupCustomerStep(query, caseIdOf(options)),
   },
   lookupCard: {
     description: "Look up a card by cardId or by customerId. Returns masked number and status.",
